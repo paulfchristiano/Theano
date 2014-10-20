@@ -65,20 +65,14 @@ def make_constant(args):
     return tuple(map(conv, args))
 
 
-def get_idx_list(inputs, idx_list, get_count=False):
+def get_idx_list(inputs, idx_list):
     '''
     Given a list of inputs to the subtensor and its idx_list reorders
     the inputs according to the idx list to get the right values.
-
-    If get_counts=True, instead returns the number of inputs consumed
-    during this process.
     '''
 
-    # The number of indices
-    n = len(inputs) - 1
-
     # The subtensor (or idx_list) does not depend on the inputs.
-    if n == 0:
+    if len(inputs) == 1:
         return tuple(idx_list)
     indices = list(reversed(list(inputs[1:])))
 
@@ -93,10 +87,7 @@ def get_idx_list(inputs, idx_list, get_count=False):
         else:
             return entry
     cdata = tuple(map(convert, idx_list))
-    if get_count:
-        return n - len(indices)
-    else:
-        return cdata
+    return cdata
 
 
 def get_canonical_form_slice(theslice, length):
