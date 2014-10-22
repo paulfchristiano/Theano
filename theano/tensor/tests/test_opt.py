@@ -1572,7 +1572,6 @@ def test_log_add():
 
     #TODO: (write and) test that the optimization works with Sum in addition to working with Add.
 
-
 def test_local_useless_inc_subtensor():
     x = tensor.matrix('x')
     y = tensor.matrix('y')
@@ -2474,6 +2473,118 @@ class Test_alloc_zero(unittest.TestCase):
                                       _e1[1], _e2[2])
                     self.assertRaises((ValueError, AssertionError), f,
                                       _e1[2], _e2[1])
+
+
+def test_local_subtensor_to_join():
+    x = T.alloc(0.0, 5, 5, 5)
+    y1  = T.tensor3()
+    y2 = T.matrix()
+
+    mode = compile.get_default_mode().including("local_setsubtensor_to_join")
+
+    f = function([y1], T.set_subtensor(x[:, 3:, :], y1))
+    topo = f.maker.fgraph.toposort()
+    assert(isinstance(topo[-1].op, Join))
+
+    z = numpy.zeros((5, 5, 5))
+    
+    a = z.copy()
+    b1 = numpy.random.randn(5, 2, 5)
+
+    a[:, 3:, :] = b1
+
+    assert(numpy.allclose(a, f(b1)))
+
+    f = function([y2], T.set_subtensor(x[2, :, :], y2))
+    topo = f.maker.fgraph.toposort()
+    assert(isinstance(topo[-1].op, Join))
+
+    a = z.copy()
+    b2 = numpy.random.randn(5, 5)
+
+    a[2,:,:] = b2
+
+    assert(numpy.allclose(a, f(b2)))
+
+
+def test_local_dot_with_joined_zeros():
+    examples = [
+            ( 0, [True, False], [(6,), (4,)] ),
+            ( 0, [True, False, False], [(5, 10), (4, 10), (1, 10)]),
+            ( 1, [False, True], [(10, 3), (10, 7)]),
+            ( 1, [False, True, True], [(10, 3, 10), (10, 5, 10), (10, 2, 10)]),
+            ( 2, [True, True], [(4, 10, 9), (4, 10, 1)])
+    ]
+
+    def make_var(is_zero, shape):
+        if is_zero:
+            return T.alloc(0.0, *shape)
+        else:
+            return T.TensorType(dtype=numpy.dtype('float64'),
+                    broadcastable=[s==1 for s in shape])()
+
+    def make_val(is_zero, shape):
+        if is_zero:
+            return numpy.zeros(shape)
+        else:
+            return numpy.random.randn(*shape)
+
+    mode = compile.get_default_mode().excluding("local_dot_with_joined_zeros")
+    theano.config.compute_test_value = 'warn'
+    for x_example in examples:
+        x_components = [make_var(z, s) for z, s in zip(x_example[1], x_example[2])]
+        x_variables = [component for z, component in zip(x_example[1], x_components) if not z]
+        x_values = [make_val(z, s) for z, s in zip(x_example[1], x_example[2])]
+        x_inputs = [x_value for z, x_value in zip(x_example[1], x_values) if not z]
+        for x_variable, x_input in zip ( x_variables, x_inputs ):
+            x_variable.tag.test_value = x_input
+        x_join = T.join(x_example[0], *x_components)
+        x_result = numpy.concatenate( x_values, x_example[0])
+        for y_example in examples:
+            y_components = [make_var(z, s) for z, s in zip(y_example[1], y_example[2])]
+            y_variables = [component for z, component in zip(y_example[1], y_components) if not z]
+            y_values = [make_val(z, s) for z, s in zip(y_example[1], y_example[2])]
+            y_inputs = [y_value for z, y_value in zip(y_example[1], y_values) if not z]
+            for y_variable, y_input in zip ( y_variables, y_inputs ):
+                y_variable.tag.test_value = y_input
+            y_join = T.join(y_example[0], *y_components)
+            y_result = numpy.concatenate( y_values, y_example[0])
+            f = function(x_variables + y_variables, T.dot(x_join, y_join))
+
+            import pdb; pdb.set_trace()
+
+            assert(numpy.allclose(f(*(x_inputs + y_inputs)), numpy.dot(x_result, y_result)))
+
+            topo = f.maker.fgraph.toposort()
+            #TODO: Actually check that the graph was optimized somehow...
+            
+
+def test_local_incsubtensor_zeros():
+
+    examples = [ 
+            ( (3, 3), (3,), (slice(None), 1) ),
+            ( (3, 4,5), (1, 3), (slice(1,None), 3, slice(None, 3) ) ),
+            ( (6,), (6,), (slice(None),) ),
+            ( (5,), (1,), (slice(2, 4),) )
+    ]
+
+    for shape, subshape, slices in examples:
+
+        x = T.alloc(0.0, *shape)
+        y = T.TensorType(dtype=numpy.dtype('float64'), 
+                broadcastable = tuple([s == 1 for s in subshape]))()
+        yv = numpy.random.randn(*subshape)
+        mode = compile.get_default_mode().including("local_incsubtensor_zeros")
+
+        f = theano.function([y], theano.tensor.inc_subtensor(x.__getitem__(slices),y))
+        topo = f.maker.fgraph.toposort()
+
+        xv = numpy.zeros(shape)
+        xv[slices] = yv
+        
+        assert(numpy.allclose(f(yv), xv))
+        assert topo[-1].op.set_instead_of_inc
+
 
 
 def test_local_subtensor_of_dot():

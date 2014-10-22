@@ -78,7 +78,6 @@ def in2out(*local_opts, **kwargs):
     else:
         local_opts, = local_opts
         if not name:
-            #import pdb;pdb.set_trace()
             name = local_opts.__name__
     ret = opt.TopoOptimizer(local_opts,
                             order='in_to_out',
@@ -2173,6 +2172,193 @@ def local_subtensor_of_alloc(node):
                                                 node.outputs[0].broadcastable))
              if b1 and not b2])
     return rval
+
+def is_zeros(x):
+    """
+    Tests if x is of the form Alloc(zeros,...)
+    """
+    if x.owner is None:
+        return False
+    if not isinstance(x.owner.op,T.Alloc):
+        return False
+    return T.extract_constant(x) == 0
+
+@register_canonicalize
+@register_specialize
+@register_stabilize
+@gof.local_optimizer([IncSubtensor])
+def local_setsubtensor_to_join(node):
+    """
+    SetSubtensor(Alloc(zeros),...)-->
+     Join(Alloc(zeros), ...)
+    """
+    if not isinstance(node.op, IncSubtensor):
+        return
+    if not node.op.set_instead_of_inc:
+        return
+    #We only perform this optimization if part of the resulting tensor will be zeros
+    if not is_zeros(node.inputs[0]) and not is_zeros(node.inputs[1]):
+        return
+
+    idxs = theano.tensor.subtensor.get_idx_list(node.inputs[1:], node.op.idx_list)
+    #We will only convert to a join if the increment was
+    #defined by a nontrivial slice on exactly one dimension.
+    #If the increment was A[:,:,...,:,x:y] = b, we will replace this by
+    #T.concatenate(A[:,:,...,:,:x], b, A[:,:,...,:,y:])
+    #lower_idxs is the first subscript, while upper_idxs is the second one
+    #if x or y is none, then we omit the corresponding term in the concatenation
+    lower_idxs = []
+    upper_idxs = []
+    start = None
+    stop = None
+    axis = None
+    lower_rank = False
+    for i, entry in enumerate(idxs):
+        if not isinstance(entry, slice):
+            if axis is not None:
+                return
+            axis = i
+            start = entry
+            stop = entry+1
+            lower_idxs.append(slice(None, start))
+            upper_idxs.append(slice(stop, None))
+            lower_rank = True
+        elif entry.step is not None and entry.step != 1:
+            return
+        elif entry.start is None and entry.stop is None:
+            lower_idxs.append(slice(None))
+            upper_idxs.append(slice(None))
+        else:
+            #If axis is not None, then there were two nontrivial slices
+            if axis is not None:
+                return
+            axis = i
+            start = entry.start
+            stop = entry.stop
+            lower_idxs.append(slice(None, start))
+            upper_idxs.append(slice(stop, None))
+    if axis is None:
+        return
+    args = []
+    if start:
+        args.append(node.inputs[0].__getitem__(tuple(lower_idxs)))
+    to_join = T.cast(node.inputs[1],node.inputs[0].dtype)
+    if lower_rank:
+        #if we were setting a lower rank subtensor, 
+        #we need to add a new dimension in axis before concatenating
+        to_join = T.shape_padleft(to_join)
+        to_join = T.unbroadcast(to_join, 0)
+        new_dims = range(1,node.out.ndim)
+        new_dims[axis:axis] = [0]
+        to_join = to_join.dimshuffle(new_dims)
+    args.append(to_join)
+    if stop:
+        args.append(node.inputs[0].__getitem__(tuple(upper_idxs)))
+    return [T.concatenate(args, axis)]
+
+@register_canonicalize
+@register_specialize
+@gof.local_optimizer([IncSubtensor])
+def local_incsubtensor_zeros(node):
+    """
+    IncSubtensor(Alloc(zeros, ...), ...) ->
+      SetSubtensor(Alloc(zeros, ...), ...)
+    """
+    if not isinstance(node.op, IncSubtensor):
+        return
+    if node.op.set_instead_of_inc:
+        return
+    if node.inputs[0].owner is None or not isinstance(node.inputs[0].owner.op, T.Alloc):
+        return
+    if not T.extract_constant(node.inputs[0]) == 0:
+        return
+    op = node.op
+    new_op = IncSubtensor(
+        op.idx_list, op.inplace, set_instead_of_inc=True,
+        destroyhandler_tolerate_aliased=op.destroyhandler_tolerate_aliased)
+    return [new_op(*node.inputs)]
+
+@register_canonicalize
+@register_specialize
+@gof.local_optimizer([T.Dot])
+def local_dot_with_joined_zeros(node):
+    """
+    T.dot(Join(axis, zeros, X), Y) --> T.join(axis, zeros', T.dot(X,Y)),
+    or T.dot(Join(axis, zeros, X), Y) --> T.dot(X, Y[...]),
+    depending on whether axis==-1.
+
+    The subscript Y[...] indicates the rows of Y which were supposed to be summed with X;
+    we omit the rows of Y which were supposed to be summed with zeros.
+    zeros' is T.zeros_like(T.dot(zeros, Y)), 
+    we rely on other optimizations to optimize out the T.dot.
+
+    We perform a similar optimization if the join occurs in the second coordinate,
+    or if the join involves more than two tensors.
+    """
+
+    if not isinstance(node.op, T.Dot):
+        return
+
+    def reduce_contraction_with_joined_zeros(axis, xs, x_index, y, y_index, contract):
+        """
+        Simplifies contract(Join(axis, xs), y) by replacing contract(zeros, y)
+        with zeros_like(contract(zeros,y)).
+        We assume that contract(x, y) contracts the dimensions x_index of x and y_index of y,
+        and rely on other optimizations to compute zeros_like(contract(zeros,y)) quickly
+        """
+        if axis == x_index:
+            #In this case, contract(Join(xs), y) is sum([contract(x,y[...])] for x in xs)
+            #The main difficulty is computing the appropriate subtensor of y
+            def slice_y(start, stop):
+                return y[tuple([slice(None) for i in range(y_index)] + [slice(start,stop)])]
+            result = T.zeros_like(contract(xs[0], y))
+            stop = 0
+            for x in xs:
+                start = stop
+                stop = start + x.shape[axis]
+                if not is_zeros(x):
+                    result += contract(x, slice_y(start,stop))
+            return [result]
+        else:
+            #In this case, contract(Join(xs), y) is Join(*[contract(x, y) for x in xs])
+            return [T.join(axis, *[ 
+                    T.zeros_like(contract(x, y))
+                    if is_zeros(x)
+                    else contract(x, y) for x in xs
+            ])]
+
+
+    x = node.inputs[0]
+    y = node.inputs[1]
+    x_dot_index = x.ndim-1
+    y_dot_index = 0 if y.ndim == 1 else y.ndim-2
+    try:
+#        import pdb; pdb.set_trace()
+#        if x.owner is not None and isinstance(x.owner.op, T.DimShuffle):
+#            axis = x.owner.op.new_order[get_scalar_constant_value(x.owner.inputs[0]) % x.ndim]
+
+        if x.owner is not None and isinstance(x.owner.op, T.Join):
+            axis = get_scalar_constant_value(x.owner.inputs[0]) % x.ndim
+            xs = x.owner.inputs[1:]
+            if any (is_zeros(x_component) for x_component in xs):
+                contract = T.dot
+                result = reduce_contraction_with_joined_zeros(
+                        axis, xs, x_dot_index, y, y_dot_index, contract
+                    )
+                if result:
+                   return result
+        if y.owner is not None and isinstance(y.owner.op, T.Join):
+            axis = get_scalar_constant_value(y.owner.inputs[0]) % y.ndim
+            ys = y.owner.inputs[1:]
+            if any (is_zeros(y_component) for y_component in ys):
+                contract = lambda a, b : T.dot(b, a)
+                return reduce_contraction_with_joined_zeros(
+                        axis, ys, y_dot_index, x, x_dot_index, contract
+                    )
+    except NotScalarConstantError:
+        return
+    return
+       
 
 
 @register_canonicalize
